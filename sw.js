@@ -1,9 +1,9 @@
-// Сервис-воркер для приложения «Замер Про»
-// Обеспечивает работу приложения в офлайн режиме
+// Сервис-воркер «Замер Про»: приложение открывается из памяти телефона мгновенно,
+// даже без интернета или при плохой связи; обновления скачиваются в фоне.
 
-const CACHE = 'zamershik-v10';
+const CACHE = 'zamershik-v11';
 
-// Список файлов для кэширования при установке
+// Файлы приложения, которые сохраняются в телефон при установке
 const PRECACHE_LIST = [
   './',
   './index.html',
@@ -17,82 +17,61 @@ const PRECACHE_LIST = [
   './icons/icon-180.png',
   './icons/icon-192.png',
   './icons/icon-512.png',
-  './icons/icon-maskable-512.png'
+  './icons/icon-maskable-512.png',
 ];
 
-// Событие установки воркера
-self.addEventListener('install', event => {
-  console.log('[SW] Установка сервис-воркера');
+self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE).then(cache => {
-      console.log('[SW] Кэширование ресурсов');
-      return cache.addAll(PRECACHE_LIST);
-    }).then(() => {
-      // Сразу активировать новый воркер
-      return self.skipWaiting();
-    })
+    caches.open(CACHE)
+      // cache: 'reload' — берём свежие файлы с сервера, а не из кэша браузера
+      .then((cache) => cache.addAll(PRECACHE_LIST.map((u) => new Request(u, { cache: 'reload' }))))
+      .then(() => self.skipWaiting()),
   );
 });
 
-// Событие активации воркера
-self.addEventListener('activate', event => {
-  console.log('[SW] Активация сервис-воркера');
+self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then(cacheNames => {
-      return Promise.all(
-        cacheNames.map(cacheName => {
-          // Удаляем старые версии кэша
-          if (cacheName !== CACHE) {
-            console.log('[SW] Удаление устаревшего кэша:', cacheName);
-            return caches.delete(cacheName);
-          }
-        })
-      );
-    }).then(() => {
-      // Берём контроль над всеми открытыми клиентами
-      return self.clients.claim();
-    })
+    caches.keys()
+      .then((names) => Promise.all(names.filter((n) => n !== CACHE).map((n) => caches.delete(n))))
+      .then(() => self.clients.claim()),
   );
 });
 
-// Событие получения запроса (fetch)
-self.addEventListener('fetch', event => {
+// Скачать свежую версию файла и положить в кэш (в фоне)
+function refresh(request) {
+  return fetch(request).then((response) => {
+    if (response.ok) {
+      const copy = response.clone();
+      caches.open(CACHE).then((cache) => cache.put(request, copy));
+    }
+    return response;
+  });
+}
+
+self.addEventListener('fetch', (event) => {
   const { request } = event;
+  if (request.method !== 'GET' || !request.url.startsWith(self.location.origin)) return;
 
-  // Обрабатываем только GET запросы и только к своему источнику
-  if (request.method !== 'GET' || !request.url.startsWith(self.location.origin)) {
+  // Открытие приложения: сразу страница из памяти, без ожидания сети
+  if (request.mode === 'navigate') {
+    event.respondWith(
+      caches.match('./index.html').then((cached) => {
+        const fresh = refresh(request).catch(() => cached);
+        return cached || fresh;
+      }),
+    );
     return;
   }
 
-  // Стратегия: сначала сеть, потом кэш
+  // Остальные файлы: из памяти, если есть; в фоне — обновление
   event.respondWith(
-    fetch(request).then(response => {
-      // Кэшируем успешные ответы
-      if (response.status === 200) {
-        const responseToCache = response.clone();
-        caches.open(CACHE).then(cache => {
-          cache.put(request, responseToCache);
-        });
+    caches.match(request, { ignoreSearch: true }).then((cached) => {
+      const fresh = refresh(request).catch(() => cached || new Response('', { status: 503 }));
+      if (cached) {
+        event.waitUntil(fresh.catch(() => {}));
+        return cached;
       }
-      return response;
-    }).catch(() => {
-      // Если нет интернета, пробуем кэш
-      return caches.match(request, { ignoreSearch: true }).then(cachedResponse => {
-        if (cachedResponse) {
-          return cachedResponse;
-        }
-
-        // Если это навигационный запрос (страница), возвращаем index.html
-        if (request.mode === 'navigate') {
-          return caches.match('./index.html');
-        }
-
-        // Иначе возвращаем ошибку (дальше браузер покажет свою страницу ошибки)
-        return new Response('Ресурс недоступен', {
-          status: 503,
-          statusText: 'Service Unavailable'
-        });
-      });
-    })
+      return fresh;
+    }),
   );
 });
